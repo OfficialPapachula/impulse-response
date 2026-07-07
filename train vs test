@@ -1,0 +1,17 @@
+train = model_df.iloc[:-24]
+test = model_df.iloc[-24:]
+
+model_lag2 = VAR(train).fit(2)
+model_lag8 = VAR(train).fit(8)
+
+forecast_lag2 = model_lag2.forecast(train.values[-2:], steps=24)
+forecast_lag8 = model_lag8.forecast(train.values[-8:], steps=24)
+
+import numpy as np
+rmse_lag2 = np.sqrt(((test.values - forecast_lag2) ** 2).mean(axis=0))
+rmse_lag8 = np.sqrt(((test.values - forecast_lag8) ** 2).mean(axis=0))
+
+print(f"{'Variable':25s}  {'Lag2 RMSE':>12s}  {'Lag8 RMSE':>12s}  {'Better':>10s}")
+for i, col in enumerate(model_df.columns):
+    better = "lag2" if rmse_lag2[i] < rmse_lag8[i] else "lag8"
+    print(f"{col:25s}  {rmse_lag2[i]:12.4f}  {rmse_lag8[i]:12.4f}  {better:>10s}")
