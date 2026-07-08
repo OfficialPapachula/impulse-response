@@ -1,0 +1,464 @@
+"""
+Tier 2 -- All GDP Components' Response to Tier 1 Shocks (standalone)
+================================================================
+
+Does NOT re-run Tier 1. Reads the cleaned shock series Tier 1 already
+saved to CSV, and pairs each shock against every Tier 2 GDP-component
+proxy in its own small bivariate VAR.
+
+Every proxy is tagged with which GDP accounting identity bucket it
+belongs to (gdp_category) and its sign (+1 normally, -1 for Imports,
+since Net Exports = Exports - Imports). This is what lets Tier 3 later
+apply BEA weights correctly -- and it's also what stops you from
+double-counting when a category has more than one proxy (e.g.
+Investment has two: Capital Goods Orders and Durable Goods Orders).
+
+GDP identity buckets covered here (Higgins 2014 / GDPNow-style split):
+    PCE          -- Personal Consumption Expenditures
+    Investment   -- Capital Goods Orders, Durable Goods Orders, Housing Starts
+    Government   -- Public Construction Spending
+    NetExports   -- Exports (+1), Imports (-1)
+    Inventories  -- Wholesale/Business Inventories
+
+WORKFLOW
+--------
+1. Load tier1_shocks.csv (already-cleaned/orthogonalized shocks)
+2. Load every Tier 2 proxy
+3. For every (shock, proxy) pair: fit a 2-variable VAR (shock first),
+   run stability + whiteness diagnostics, extract the peak response
+4. Print one summary table covering every pair, tagged by gdp_category
+   and sign -- ready for Tier 3 to consume directly
+5. Print a pooled-by-category preview: for categories with more than
+   one proxy (Investment, NetExports), shows the sign-adjusted average
+   response so you can see what Tier 3's aggregation will actually use
+6. Interactive scenario test + on-demand plotting, same as before
+7. Optional out-of-sample RMSE check for any single pair you want to
+   scrutinize more closely (not run automatically for all pairs --
+   expensive, and meant for spot-checking, same spirit as the Tier 1
+   lag validation you already did)
+
+CONFIGURE THE SECTIONS BELOW BEFORE RUNNING.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from statsmodels.tsa.api import VAR
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+TIER1_SHOCKS_FILE = r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\BVAR\tier1_shocks.csv"
+
+# Every entry needs: name, file, date_col, value_col, resample, transform,
+# gdp_category (which GDP identity bucket it maps to), sign (+1 or -1).
+TIER2_COMPONENTS = [
+    {"name": "PCE",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "PCE Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "PCE", "sign": 1},
+
+    {"name": "CapitalGoodsOrders",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Core Capital Goods Orders Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "Investment", "sign": 1},
+
+    {"name": "DurableGoodsOrders",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Durable Goods Orders Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "Investment", "sign": 1},
+
+    {"name": "HousingStarts",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Housing Starts Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "Investment", "sign": 1},
+
+    {"name": "PublicConstruction",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Public Construction Spending Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "Government", "sign": 1},
+
+    {"name": "Exports",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Real Exports Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "NetExports", "sign": 1},
+
+    {"name": "Imports",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Real Imports Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "NetExports", "sign": -1},   # subtracted in the GDP identity
+
+    {"name": "WholesaleInventories",
+     "file": r"C:\Users\oaksla\OneDrive - Federated Hermes, Inc\Desktop\Dataframe.xlsx",
+     "date_col": "Date", "value_col": "Wholesale Inventories Raw", "resample": "ME",
+     "transform": "log_diff", "gdp_category": "Inventories", "sign": 1},
+]
+
+TIER2_MAX_LAGS = 6     # small ceiling -- each pair is only 2 variables
+IRF_PERIODS = 12
+SIGNIF = 0.05
+MIN_OBS = 24           # minimum overlapping months required to trust a pair
+
+# ============================================================
+# LOADING / TRANSFORM (same pattern as Tier 1)
+# ============================================================
+
+def load_series(cfg):
+    path = cfg["file"]
+
+    if str(path).lower().endswith(".csv"):
+        df = None
+        last_err = None
+        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin1"):
+            try:
+                df = pd.read_csv(path, encoding=enc)
+                break
+            except UnicodeDecodeError as e:
+                last_err = e
+        if df is None:
+            raise last_err
+    else:
+        df = pd.read_excel(path)
+
+    df.columns = df.columns.str.strip()
+
+    for col in (cfg["date_col"], cfg["value_col"]):
+        if col not in df.columns:
+            raise KeyError(
+                f"Column '{col}' not found in {path}. "
+                f"Actual columns are: {list(df.columns)}"
+            )
+
+    df[cfg["date_col"]] = pd.to_datetime(df[cfg["date_col"]], errors="coerce")
+    df[cfg["value_col"]] = pd.to_numeric(df[cfg["value_col"]], errors="coerce")
+    df = df.dropna(subset=[cfg["date_col"], cfg["value_col"]])
+
+    df = df.set_index(cfg["date_col"]).sort_index()
+    s = df[cfg["value_col"]].rename(cfg["name"])
+
+    if cfg.get("resample"):
+        s = s.resample(cfg["resample"]).last()
+
+    return s
+
+
+def apply_transform(s, transform, scale=1.0):
+    s = s * scale
+    if transform == "log_diff":
+        s = np.log(s)
+        s = s.replace([np.inf, -np.inf], np.nan)
+        s = s.diff()
+    elif transform == "diff":
+        s = s.diff()
+    elif transform == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown transform '{transform}' -- use 'log_diff', 'diff', or 'none'")
+    return s
+
+
+def load_tier1_shocks(path):
+    shocks = pd.read_csv(path, index_col=0, parse_dates=True)
+    print(f"Loaded Tier 1 shocks from {path}")
+    print(f"  {len(shocks)} months, {shocks.index.min().date()} to {shocks.index.max().date()}")
+    print(f"  Shock variables: {list(shocks.columns)}")
+    return shocks
+
+
+# ============================================================
+# DIAGNOSTICS (non-blocking -- informational flags only)
+# ============================================================
+
+def quick_diagnostics(results, label=""):
+    stable = results.is_stable()
+    try:
+        nlags = min(12, max(results.nobs - 1, 1))
+        whiteness = results.test_whiteness(nlags=nlags, signif=SIGNIF)
+        white_p = whiteness.pvalue
+        white_ok = white_p >= SIGNIF
+    except Exception:
+        white_ok, white_p = None, None
+
+    flags = []
+    if not stable:
+        flags.append("UNSTABLE")
+    if white_ok is False:
+        flags.append(f"residual autocorrelation (p={white_p:.4f})")
+
+    status = "OK" if not flags else "CAUTION: " + "; ".join(flags)
+    print(f"  [{label}] stability={stable}, whiteness_p="
+          f"{white_p if white_p is not None else 'n/a'} -> {status}")
+    return stable, white_p
+
+
+def evaluate_oos_rmse(pair_df, max_lags_list=(2, 4, 6), holdout=24):
+    """Optional, on-demand out-of-sample check for one specific pair.
+    Not run automatically for every pair -- call manually when you want
+    to scrutinize a specific component's reliability more closely,
+    same idea as the Tier 1 lag validation."""
+    if len(pair_df) < holdout + 30:
+        print("  Not enough observations for a meaningful OOS split.")
+        return None
+
+    train = pair_df.iloc[:-holdout]
+    test = pair_df.iloc[-holdout:]
+
+    print(f"\nOut-of-sample RMSE check (holdout = {holdout} months):")
+    for lag in max_lags_list:
+        try:
+            model = VAR(train).fit(lag)
+            forecast = model.forecast(train.values[-lag:], steps=holdout)
+            rmse = np.sqrt(((test.values - forecast) ** 2).mean(axis=0))
+            print(f"  lag {lag}: " + ", ".join(
+                f"{col}={rmse[i]:.4f}" for i, col in enumerate(pair_df.columns)))
+        except Exception as e:
+            print(f"  lag {lag}: failed ({e})")
+
+
+# ============================================================
+# VAR FITTING
+# ============================================================
+
+def fit_var_auto(df, max_lags=TIER2_MAX_LAGS):
+    model = VAR(df)
+    lag_selection = model.select_order(maxlags=max_lags)
+    chosen_lag = lag_selection.aic
+    results = model.fit(chosen_lag if chosen_lag > 0 else 1)
+    return results, (chosen_lag if chosen_lag > 0 else 1)
+
+
+# ============================================================
+# IRF GRID PLOT (2x2 for any single pair)
+# ============================================================
+
+def plot_irf_grid(results, var_names, periods=IRF_PERIODS, signif=SIGNIF, title_suffix=""):
+    irf = results.irf(periods=periods)
+    orth_irfs = irf.orth_irfs
+    stderr = irf.stderr(orth=True)
+
+    z = 1.96 if signif == 0.05 else abs(np.round(1 - signif, 2))
+    horizons = np.arange(orth_irfs.shape[0])
+    k = len(var_names)
+
+    fig, axes = plt.subplots(k, k, figsize=(3.2 * k, 2.6 * k), squeeze=False)
+    fig.suptitle(f"Impulse Response -- Cholesky One S.D. Innovations, "
+                 f"{int((1-signif)*100)}% CI{title_suffix}", fontsize=12, y=1.02)
+
+    for i, response_var in enumerate(var_names):
+        for j, impulse_var in enumerate(var_names):
+            ax = axes[i, j]
+            resp = orth_irfs[:, i, j]
+            se = stderr[:, i, j]
+            upper = resp + z * se
+            lower = resp - z * se
+
+            ax.plot(horizons, resp, color="black", linewidth=1.3)
+            ax.fill_between(horizons, lower, upper, color="gray", alpha=0.3)
+            ax.axhline(0, color="black", linewidth=0.6, linestyle="--")
+            ax.set_title(f"{response_var} <- {impulse_var}", fontsize=9, style="italic")
+            ax.set_xlim(0, periods)
+            ax.grid(alpha=0.2)
+
+    plt.tight_layout()
+    plt.show()
+    return orth_irfs, stderr, horizons
+
+
+# ============================================================
+# TIER 2 PAIR MODELING
+# ============================================================
+
+def run_tier2_pair(shock_series, component_series, shock_name, component_name,
+                    gdp_category, sign, max_lags=TIER2_MAX_LAGS,
+                    periods=IRF_PERIODS, signif=SIGNIF):
+    """Fits shock-first 2-variable VAR, runs diagnostics, extracts peak
+    response. Returns (summary_dict, fitted_results_or_None)."""
+
+    pair_df = pd.concat([shock_series, component_series], axis=1, sort=True).dropna()
+    pair_df.columns = [shock_name, component_name]
+
+    base_summary = {
+        "gdp_category": gdp_category, "component": component_name, "sign": sign,
+        "shock": shock_name, "n_obs": len(pair_df), "lag": None,
+        "resid_std_shock": None, "peak_response": None, "peak_response_signed": None,
+        "peak_period": None, "significant": None, "stable": None,
+        "whiteness_p": None, "note": "",
+    }
+
+    if len(pair_df) < MIN_OBS:
+        base_summary["note"] = f"too few overlapping observations (<{MIN_OBS})"
+        return base_summary, None
+
+    results, chosen_lag = fit_var_auto(pair_df, max_lags=max_lags)
+    stable, white_p = quick_diagnostics(results, label=f"{shock_name} -> {component_name}")
+
+    resid_std_shock = results.resid[shock_name].std()
+
+    irf = results.irf(periods=periods)
+    orth_irfs = irf.orth_irfs
+    stderr = irf.stderr(orth=True)
+
+    z = 1.96 if signif == 0.05 else abs(np.round(1 - signif, 2))
+    resp = orth_irfs[:, 1, 0]   # component's response to the shock
+    se = stderr[:, 1, 0]
+
+    peak_idx = int(np.argmax(np.abs(resp)))
+    peak_val = float(resp[peak_idx])
+    lower = peak_val - z * se[peak_idx]
+    upper = peak_val + z * se[peak_idx]
+    significant = bool((lower > 0) or (upper < 0))
+
+    base_summary.update({
+        "lag": chosen_lag,
+        "resid_std_shock": round(resid_std_shock, 5),
+        "peak_response": round(peak_val, 5),
+        "peak_response_signed": round(peak_val * sign, 5),   # sign-adjusted, ready for Tier 3
+        "peak_period": peak_idx,
+        "significant": significant,
+        "stable": stable,
+        "whiteness_p": round(white_p, 4) if white_p is not None else None,
+    })
+
+    return base_summary, results
+
+
+def pool_by_category(summary_df):
+    """Preview of what Tier 3 will consume: for each (gdp_category, shock)
+    pair, averages the sign-adjusted peak response across every proxy in
+    that category. Categories with one proxy just pass through unchanged."""
+    pooled = (
+        summary_df.dropna(subset=["peak_response_signed"])
+        .groupby(["gdp_category", "shock"])
+        .agg(
+            n_proxies=("component", "count"),
+            proxies=("component", lambda x: ", ".join(x)),
+            pooled_response=("peak_response_signed", "mean"),
+            any_significant=("significant", "any"),
+        )
+        .reset_index()
+    )
+    return pooled
+
+
+# ============================================================
+# SCENARIO TESTING
+# ============================================================
+
+def run_scenario(shock_name, shock_size, tier2_models, component_name,
+                  periods=IRF_PERIODS, signif=SIGNIF, size_is_pct=True):
+    """
+    shock_name:    which Tier 1 shock to test, e.g. "WTI"
+    shock_size:    if size_is_pct=True, a % move (e.g. 20 for 20%);
+                   if False, a multiple of 1 S.D. (e.g. 1.5 for 1.5x baseline)
+    tier2_models:  dict of {shock_name: fitted VAR results} for this component
+    component_name: label for printing only
+    """
+    results = tier2_models.get(shock_name)
+    if results is None:
+        print(f"No fitted model available for shock '{shock_name}' -> '{component_name}'")
+        return None
+
+    resid_std = results.resid[shock_name].std()
+    resid_std_pct = resid_std * 100
+
+    scale_factor = shock_size / resid_std_pct if size_is_pct else shock_size
+
+    irf = results.irf(periods=periods)
+    orth_irfs = irf.orth_irfs
+    stderr = irf.stderr(orth=True)
+    z = 1.96 if signif == 0.05 else abs(np.round(1 - signif, 2))
+
+    resp = orth_irfs[:, 1, 0] * scale_factor
+    se = stderr[:, 1, 0] * scale_factor
+
+    peak_idx = int(np.argmax(np.abs(resp)))
+    peak_val = float(resp[peak_idx])
+    lower = peak_val - z * se[peak_idx]
+    upper = peak_val + z * se[peak_idx]
+    significant = bool((lower > 0) or (upper < 0))
+
+    extrapolation_warning = None
+    if abs(scale_factor) > 3:
+        extrapolation_warning = (
+            f"Shock is {scale_factor:.1f}x the typical {shock_name} move "
+            f"({resid_std_pct:.2f}% baseline) -- treat as extrapolation, not a direct estimate."
+        )
+
+    print(f"\n--- Scenario: {shock_name} shock -> {component_name} ---")
+    print(f"  Baseline 1 S.D. {shock_name} move: {resid_std_pct:.2f}%")
+    print(f"  Scale factor applied: {scale_factor:.2f}x")
+    print(f"  Peak {component_name} response: {peak_val:.5f} at period {peak_idx}")
+    print(f"  Statistically significant at peak: {significant}")
+    if extrapolation_warning:
+        print(f"  WARNING: {extrapolation_warning}")
+
+    return {
+        "shock": shock_name, "component": component_name,
+        "scale_factor": scale_factor, "peak_response": peak_val,
+        "peak_period": peak_idx, "significant": significant,
+        "extrapolation_warning": extrapolation_warning,
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    tier1_shocks = load_tier1_shocks(TIER1_SHOCKS_FILE)
+
+    tier2_data = {}
+    for cfg in TIER2_COMPONENTS:
+        raw = load_series(cfg)
+        transformed = apply_transform(raw, cfg.get("transform", "diff"), cfg.get("scale", 1.0)).dropna()
+        tier2_data[cfg["name"]] = transformed
+
+    print("\n" + "=" * 70)
+    print("TIER 2 -- Fitting each Tier 1 shock against each GDP-component proxy")
+    print("=" * 70)
+
+    # tier2_models[component_name][shock_name] = fitted VAR results
+    tier2_models = {}
+    summary_rows = []
+
+    for cfg in TIER2_COMPONENTS:
+        component_name = cfg["name"]
+        component_series = tier2_data[component_name]
+        gdp_category = cfg["gdp_category"]
+        sign = cfg.get("sign", 1)
+
+        tier2_models[component_name] = {}
+        for shock_name in tier1_shocks.columns:
+            summary, results = run_tier2_pair(
+                tier1_shocks[shock_name], component_series, shock_name,
+                component_name, gdp_category, sign
+            )
+            summary_rows.append(summary)
+            if results is not None:
+                tier2_models[component_name][shock_name] = results
+
+    summary_df = pd.DataFrame(summary_rows)
+    pd.set_option("display.width", 160)
+    pd.set_option("display.max_columns", None)
+
+    print("\nTier 2 Summary -- Peak Response of Each Proxy to Each Tier 1 Shock:")
+    print(summary_df.to_string(index=False))
+
+    print("\n" + "=" * 70)
+    print("Pooled-by-Category Preview (what Tier 3 will consume)")
+    print("=" * 70)
+    pooled_df = pool_by_category(summary_df)
+    print(pooled_df.to_string(index=False))
+
+    # ---- Example scenario test -- edit these to test any shock/component ----
+    # run_scenario("WTI", shock_size=20, tier2_models=tier2_models["PCE"], component_name="PCE")
+    # run_scenario("FED Funds", shock_size=1.5, tier2_models=tier2_models["HousingStarts"], component_name="HousingStarts", size_is_pct=False)
+
+    # ---- Example on-demand plot ----
+    # plot_irf_grid(tier2_models["PCE"]["WTI"], ["WTI", "PCE"], title_suffix="\nWTI -> PCE")
+
+    # ---- Example on-demand OOS check for one specific pair you want to scrutinize ----
+    # pair_df = pd.concat([tier1_shocks["WTI"], tier2_data["Exports"]], axis=1, sort=True).dropna()
+    # pair_df.columns = ["WTI", "Exports"]
+    # evaluate_oos_rmse(pair_df)
