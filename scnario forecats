@@ -1,0 +1,73 @@
+def scenario_forecasts(self, Y, H, shock_j, size_sd, shock_month,
+                           n_draws, rng, order=None, conditions=None,
+                           exog_future=None):
+        """Baseline vs shocked paths under a Cholesky-identified shock.
+        Returns (base, shocked, deltas), each (n_draws, H, n)."""
+        p, n = self.p, self.n
+        conditions = conditions or {}
+        perm = list(range(n)) if order is None else list(order)
+        k_pos = perm.index(shock_j)
+        t0 = shock_month - 1
+        obs_ix = sorted(conditions.keys())
+        obs_v = np.array([conditions[i] for i in obs_ix], dtype=float)
+        un_ix = [i for i in range(H * n) if i not in set(obs_ix)]
+        base = np.empty((n_draws, H, n))
+        deltas = np.empty((n_draws, H, n))
+        hist = Y[-p:].copy()
+
+        for d in range(n_draws):
+            B, Sigma, _ = self._draw_params(rng)
+            A = [B[l * n:(l + 1) * n, :].T for l in range(p)]
+
+            # --- baseline path: identical to the body of conditional_paths ---
+            lags = hist.copy()
+            M = np.empty((H, n))
+            for h in range(H):
+                x = np.concatenate([lags[-l - 1] for l in range(p)] + [[1.0]])
+                if self.n_exog:
+                    xf = (exog_future[h] if exog_future is not None
+                          else np.zeros(self.n_exog))
+                    x = np.concatenate([x, xf])
+                M[h] = x @ B
+                lags = np.vstack([lags, M[h]])
+            Psi = _ma_matrices(A, n, p, H - 1)
+            C = np.zeros((H * n, H * n))
+            for i in range(1, H + 1):
+                for j in range(i, H + 1):
+                    blk = np.zeros((n, n))
+                    for s in range(1, i + 1):
+                        blk += Psi[i - s] @ Sigma @ Psi[j - s].T
+                    C[(i - 1) * n:i * n, (j - 1) * n:j * n] = blk
+                    if i != j:
+                        C[(j - 1) * n:j * n, (i - 1) * n:i * n] = blk.T
+            mvec = M.reshape(-1)
+            path = np.empty(H * n)
+            if obs_ix:
+                Coo = C[np.ix_(obs_ix, obs_ix)] + 1e-10 * np.eye(len(obs_ix))
+                Cuo = C[np.ix_(un_ix, obs_ix)]
+                Cuu = C[np.ix_(un_ix, un_ix)]
+                sol = np.linalg.solve(Coo, obs_v - mvec[obs_ix])
+                mu_c = mvec[un_ix] + Cuo @ sol
+                Cov_c = Cuu - Cuo @ np.linalg.solve(Coo, Cuo.T)
+                Cov_c = 0.5 * (Cov_c + Cov_c.T)
+                L = cholesky(Cov_c + 1e-8 * np.eye(len(un_ix)))
+                path[obs_ix] = obs_v
+                path[un_ix] = mu_c + L @ rng.standard_normal(len(un_ix))
+            else:
+                L = cholesky(C + 1e-8 * np.eye(H * n))
+                path = mvec + L @ rng.standard_normal(H * n)
+            base[d] = path.reshape(H, n)
+
+            # --- NEW: structural impact + impulse deltas ---
+            Sp = Sigma[np.ix_(perm, perm)]
+            Pp = cholesky(Sp + 1e-12 * np.eye(n))
+            impact = np.zeros(n)
+            for i in range(n):
+                impact[perm[i]] = Pp[i, k_pos]
+            impact *= size_sd
+            dl = np.zeros((H, n))
+            for h in range(t0, H):
+                dl[h] = Psi[h - t0] @ impact
+            deltas[d] = dl
+
+        return base, base + deltas, deltas
